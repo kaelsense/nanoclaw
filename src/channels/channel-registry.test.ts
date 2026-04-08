@@ -29,7 +29,9 @@ function now() {
 }
 
 /** Create a mock ChannelAdapter for testing. */
-function createMockAdapter(channelType: string): ChannelAdapter & { delivered: OutboundMessage[]; inbound: InboundMessage[] } {
+function createMockAdapter(
+  channelType: string,
+): ChannelAdapter & { delivered: OutboundMessage[]; inbound: InboundMessage[] } {
   const delivered: OutboundMessage[] = [];
   const inbound: InboundMessage[] = [];
   let setupConfig: ChannelSetup | null = null;
@@ -74,9 +76,8 @@ describe('channel registry', () => {
   });
 
   it('should register and retrieve channel adapters', async () => {
-    const { registerChannelAdapter, getRegisteredChannelNames, getChannelContainerConfig } = await import(
-      './channel-registry.js'
-    );
+    const { registerChannelAdapter, getRegisteredChannelNames, getChannelContainerConfig } =
+      await import('./channel-registry.js');
 
     registerChannelAdapter('test-channel', {
       factory: () => createMockAdapter('test'),

@@ -20,11 +20,7 @@ import { log } from './log.js';
 // import './channels/discord-v2.js';
 
 import type { ChannelAdapter, ChannelSetup, ConversationConfig } from './channels/adapter.js';
-import {
-  initChannelAdapters,
-  teardownChannelAdapters,
-  getChannelAdapter,
-} from './channels/channel-registry.js';
+import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from './channels/channel-registry.js';
 
 async function main(): Promise<void> {
   log.info('NanoClaw v2 starting');

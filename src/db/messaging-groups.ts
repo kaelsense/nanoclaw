@@ -27,9 +27,7 @@ export function getAllMessagingGroups(): MessagingGroup[] {
 }
 
 export function getMessagingGroupsByChannel(channelType: string): MessagingGroup[] {
-  return getDb()
-    .prepare('SELECT * FROM messaging_groups WHERE channel_type = ?')
-    .all(channelType) as MessagingGroup[];
+  return getDb().prepare('SELECT * FROM messaging_groups WHERE channel_type = ?').all(channelType) as MessagingGroup[];
 }
 
 export function updateMessagingGroup(
