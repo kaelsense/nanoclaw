@@ -1,3 +1,4 @@
+import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
 /**
@@ -72,3 +73,5 @@ export class MockProvider implements AgentProvider {
     };
   }
 }
+
+registerProvider('mock', (opts) => new MockProvider(opts));

@@ -1,16 +1,13 @@
 import type { AgentProvider, ProviderOptions } from './types.js';
-import { ClaudeProvider } from './claude.js';
-import { MockProvider } from './mock.js';
+import { getProviderFactory } from './provider-registry.js';
 
-export type ProviderName = 'claude' | 'mock';
+/**
+ * Any registered provider name. Kept as a named alias for readability; the
+ * set of valid names is open and determined at runtime by whichever provider
+ * modules the `providers/index.ts` barrel imports.
+ */
+export type ProviderName = string;
 
 export function createProvider(name: ProviderName, options: ProviderOptions = {}): AgentProvider {
-  switch (name) {
-    case 'claude':
-      return new ClaudeProvider(options);
-    case 'mock':
-      return new MockProvider(options);
-    default:
-      throw new Error(`Unknown provider: ${name}`);
-  }
+  return getProviderFactory(name)(options);
 }

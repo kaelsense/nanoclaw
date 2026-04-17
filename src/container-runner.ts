@@ -18,6 +18,14 @@ import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './delivery.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './mount-security.js';
+// Provider host-side config barrel — each provider that needs host-side
+// container setup self-registers on import.
+import './providers/index.js';
+import {
+  getProviderContainerConfig,
+  type ProviderContainerContribution,
+  type VolumeMount,
+} from './providers/provider-container-registry.js';
 import {
   markContainerIdle,
   markContainerRunning,
@@ -29,12 +37,6 @@ import {
 import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL });
-
-interface VolumeMount {
-  hostPath: string;
-  containerPath: string;
-  readonly: boolean;
-}
 
 /** Active containers tracked by session ID. */
 const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
@@ -92,12 +94,25 @@ async function spawnContainer(session: Session): Promise<void> {
   writeDestinations(agentGroup.id, session.id);
   writeSessionRouting(agentGroup.id, session.id);
 
-  const mounts = buildMounts(agentGroup, session);
+  // Resolve the effective provider + any host-side contribution it declares
+  // (extra mounts, env passthrough). Computed once and threaded through both
+  // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
+  const { provider, contribution } = resolveProviderContribution(session, agentGroup);
+
+  const mounts = buildMounts(agentGroup, session, contribution);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
-  const args = await buildContainerArgs(mounts, containerName, session, agentGroup, agentIdentifier);
+  const args = await buildContainerArgs(
+    mounts,
+    containerName,
+    session,
+    agentGroup,
+    provider,
+    contribution,
+    agentIdentifier,
+  );
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
@@ -166,7 +181,27 @@ export function killContainer(sessionId: string, reason: string): void {
   }
 }
 
-function buildMounts(agentGroup: AgentGroup, session: Session): VolumeMount[] {
+function resolveProviderContribution(
+  session: Session,
+  agentGroup: AgentGroup,
+): { provider: string; contribution: ProviderContainerContribution } {
+  const provider = (session.agent_provider || agentGroup.agent_provider || 'claude').toLowerCase();
+  const fn = getProviderContainerConfig(provider);
+  const contribution = fn
+    ? fn({
+        sessionDir: sessionDir(agentGroup.id, session.id),
+        agentGroupId: agentGroup.id,
+        hostEnv: process.env,
+      })
+    : {};
+  return { provider, contribution };
+}
+
+function buildMounts(
+  agentGroup: AgentGroup,
+  session: Session,
+  providerContribution: ProviderContainerContribution,
+): VolumeMount[] {
   // Per-group filesystem state lives forever after first creation. Init is
   // idempotent: it only writes paths that don't already exist, so this call
   // is a no-op for groups that have spawned before. Pulling in upstream
@@ -208,6 +243,11 @@ function buildMounts(agentGroup: AgentGroup, session: Session): VolumeMount[] {
     mounts.push(...validated);
   }
 
+  // Provider-contributed mounts (e.g. opencode-xdg)
+  if (providerContribution.mounts) {
+    mounts.push(...providerContribution.mounts);
+  }
+
   return mounts;
 }
 
@@ -216,13 +256,15 @@ async function buildContainerArgs(
   containerName: string,
   session: Session,
   agentGroup: AgentGroup,
+  provider: string,
+  providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName];
 
   // Environment
   args.push('-e', `TZ=${TIMEZONE}`);
-  args.push('-e', `AGENT_PROVIDER=${session.agent_provider || agentGroup.agent_provider || 'claude'}`);
+  args.push('-e', `AGENT_PROVIDER=${provider}`);
   // Two-DB split: container reads inbound.db, writes outbound.db
   args.push('-e', 'SESSION_INBOUND_DB_PATH=/workspace/inbound.db');
   args.push('-e', 'SESSION_OUTBOUND_DB_PATH=/workspace/outbound.db');
@@ -233,6 +275,13 @@ async function buildContainerArgs(
   }
   args.push('-e', `NANOCLAW_AGENT_GROUP_ID=${agentGroup.id}`);
   args.push('-e', `NANOCLAW_AGENT_GROUP_NAME=${agentGroup.name}`);
+
+  // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
+  if (providerContribution.env) {
+    for (const [key, value] of Object.entries(providerContribution.env)) {
+      args.push('-e', `${key}=${value}`);
+    }
+  }
 
   // Users allowed to run admin commands (e.g. /clear) inside this container.
   // Computed at wake time: owners + global admins + admins scoped to this

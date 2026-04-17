@@ -3,6 +3,7 @@ import path from 'path';
 
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
+import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
 function log(msg: string): void {
@@ -271,3 +272,5 @@ export class ClaudeProvider implements AgentProvider {
     };
   }
 }
+
+registerProvider('claude', (opts) => new ClaudeProvider(opts));

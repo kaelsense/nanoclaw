@@ -8,7 +8,8 @@
  *   - SESSION_INBOUND_DB_PATH:  path to host-owned inbound DB (default: /workspace/inbound.db)
  *   - SESSION_OUTBOUND_DB_PATH: path to container-owned outbound DB (default: /workspace/outbound.db)
  *   - SESSION_HEARTBEAT_PATH:   heartbeat file path (default: /workspace/.heartbeat)
- *   - AGENT_PROVIDER: 'claude' | 'mock' (default: claude)
+ *   - AGENT_PROVIDER: any registered provider name (default: claude). The
+ *     set of registered providers is whatever `providers/index.ts` imports.
  *   - NANOCLAW_ASSISTANT_NAME: assistant name for transcript archiving
  *   - NANOCLAW_ADMIN_USER_IDS: comma-separated user IDs allowed to run admin commands
  *
@@ -27,6 +28,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { buildSystemPromptAddendum } from './destinations.js';
+// Providers barrel — each enabled provider self-registers on import.
+// Provider skills append imports to providers/index.ts.
+import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import { runPollLoop } from './poll-loop.js';
 
