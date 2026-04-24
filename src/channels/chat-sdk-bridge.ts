@@ -142,12 +142,27 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           width: (att as unknown as Record<string, unknown>).width,
           height: (att as unknown as Record<string, unknown>).height,
         };
+        const attUrl = (att as unknown as Record<string, unknown>).url;
         if (att.fetchData) {
           try {
             const buffer = await att.fetchData();
             entry.data = buffer.toString('base64');
           } catch (err) {
             log.warn('Failed to download attachment', { type: att.type, err });
+          }
+        } else if (typeof attUrl === 'string') {
+          // Some adapters (e.g. @chat-adapter/discord for DM inbound) expose a
+          // signed CDN URL instead of fetchData(); download from the URL so the
+          // existing inbox extractor (session-manager.extractAttachmentFiles)
+          // can persist the file to /workspace/inbox/<messageId>/<filename>.
+          try {
+            const res = await fetch(attUrl);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const buffer = Buffer.from(await res.arrayBuffer());
+            entry.data = buffer.toString('base64');
+          } catch (err) {
+            log.warn('Failed to download attachment via URL', { type: att.type, name: att.name, err });
+            entry.url = attUrl;
           }
         }
         enriched.push(entry);
