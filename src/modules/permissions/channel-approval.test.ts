@@ -357,6 +357,108 @@ describe('unknown-channel registration flow', () => {
   });
 });
 
+describe('sole-owner shortcut', () => {
+  function ownerMention(platformId: string, text = '@bot hi') {
+    return {
+      channelType: 'telegram',
+      platformId,
+      threadId: 'thread-1',
+      message: {
+        id: `msg-${Math.random().toString(36).slice(2, 8)}`,
+        kind: 'chat' as const,
+        content: JSON.stringify({ senderId: 'owner', senderName: 'Owner', text }),
+        timestamp: now(),
+        isMention: true,
+      },
+    };
+  }
+
+  it('auto-wires (no card) when sole owner mentions the bot in a new channel with single agent group', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { wakeContainer } = await import('../../container-runner.js');
+    (wakeContainer as unknown as ReturnType<typeof vi.fn>).mockClear();
+
+    await routeInbound(ownerMention('chat-owner-shortcut'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const { getDb } = await import('../../db/connection.js');
+
+    // No approval card path was taken: no pending row.
+    const pendingCount = (
+      getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }
+    ).c;
+    expect(pendingCount).toBe(0);
+
+    // Wiring was created directly.
+    const mg = getMessagingGroupByPlatform('telegram', 'chat-owner-shortcut');
+    expect(mg).toBeDefined();
+    const mga = getDb()
+      .prepare('SELECT agent_group_id, engage_mode, engage_pattern FROM messaging_group_agents WHERE messaging_group_id = ?')
+      .get(mg!.id) as { agent_group_id: string; engage_mode: string; engage_pattern: string | null };
+    expect(mga).toBeDefined();
+    expect(mga.agent_group_id).toBe('ag-1');
+    expect(mga.engage_mode).toBe('mention-sticky');
+
+    // Container woken via replay.
+    expect(wakeContainer).toHaveBeenCalled();
+
+    // Owner received a confirmation DM (plain text, not an ask_question card).
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    const [channel, platformId, , , content] = deliverMock.mock.calls[0];
+    expect(channel).toBe('telegram');
+    expect(platformId).toBe('dm-owner');
+    const payload = JSON.parse(content as string);
+    expect(payload.type).toBeUndefined();
+    expect(payload.text).toContain('Auto-wired');
+    expect(payload.text).toContain('Andy');
+  });
+
+  it('falls back to approval flow when a co-owner exists, even with a single agent group', async () => {
+    upsertUser({ id: 'telegram:co-owner', kind: 'telegram', display_name: 'Co', created_at: now() });
+    grantRole({
+      user_id: 'telegram:co-owner',
+      role: 'owner',
+      agent_group_id: null,
+      granted_by: null,
+      granted_at: now(),
+    });
+
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(ownerMention('chat-multi-owner'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const { getDb } = await import('../../db/connection.js');
+
+    // Approval card was delivered; no wiring yet.
+    const pendingCount = (
+      getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }
+    ).c;
+    expect(pendingCount).toBe(1);
+
+    const mg = getMessagingGroupByPlatform('telegram', 'chat-multi-owner');
+    const mgaCount = (
+      getDb()
+        .prepare('SELECT COUNT(*) AS c FROM messaging_group_agents WHERE messaging_group_id = ?')
+        .get(mg!.id) as { c: number }
+    ).c;
+    expect(mgaCount).toBe(0);
+  });
+
+  it('falls back to approval flow when a second agent group exists, even with a sole owner', async () => {
+    createAgentGroup({ id: 'ag-2', name: 'Beta', folder: 'beta', agent_provider: null, created_at: now() });
+
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(ownerMention('chat-multi-agent'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const { getDb } = await import('../../db/connection.js');
+    const pendingCount = (
+      getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }
+    ).c;
+    expect(pendingCount).toBe(1);
+  });
+});
+
 describe('no-owner / no-agent failure modes', () => {
   it('no owner → no card, no pending row (fresh-install bootstrap path)', async () => {
     // Wipe the owner grant set up in the outer beforeEach.

@@ -15,8 +15,10 @@
  * Without this module: sender resolution is a no-op (userId=null); the
  * access gate is not registered and core defaults to allow-all.
  */
+import { getAllAgentGroups } from '../../db/agent-groups.js';
 import { recordDroppedMessage } from '../../db/dropped-messages.js';
 import { createMessagingGroupAgent, setMessagingGroupDeniedAt } from '../../db/messaging-groups.js';
+import { getDeliveryAdapter } from '../../delivery.js';
 import {
   routeInbound,
   setAccessGate,
@@ -28,13 +30,14 @@ import {
 import type { InboundEvent } from '../../channels/adapter.js';
 import { registerResponseHandler, type ResponsePayload } from '../../response-registry.js';
 import { log } from '../../log.js';
-import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
+import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from '../../types.js';
 import { canAccessAgentGroup } from './access.js';
 import { requestChannelApproval } from './channel-approval.js';
 import { addMember } from './db/agent-group-members.js';
 import { deletePendingChannelApproval, getPendingChannelApproval } from './db/pending-channel-approvals.js';
 import { deletePendingSenderApproval, getPendingSenderApproval } from './db/pending-sender-approvals.js';
-import { hasAdminPrivilege } from './db/user-roles.js';
+import { getOwners, hasAdminPrivilege, isOwner } from './db/user-roles.js';
+import { ensureUserDm } from './user-dm.js';
 import { getUser, upsertUser } from './db/users.js';
 import { requestSenderApproval } from './sender-approval.js';
 
@@ -260,7 +263,138 @@ registerResponseHandler(handleSenderApprovalResponse);
 
 // ── Unknown-channel registration flow ──
 
+/**
+ * Persist a channel→agent wiring with MVP defaults and replay the
+ * triggering event so the user's original message reaches the agent
+ * without a manual retry.
+ *
+ * Shared between the approval-card path (handleChannelApprovalResponse)
+ * and the sole-owner shortcut (gate auto-approve). Caller is responsible
+ * for clearing any pending_channel_approvals row before invoking this.
+ */
+async function applyChannelWiring(
+  messagingGroupId: string,
+  agentGroupId: string,
+  event: InboundEvent,
+  approverUserId: string,
+): Promise<void> {
+  // Decide engage_mode from the original event. DMs (`isMention=true` &
+  // not in a group) get `pattern='.'` (always respond). Group mentions
+  // get `mention-sticky` (respond now + follow the thread).
+  //
+  // We can't read `mg.is_group` reliably here because we only auto-create
+  // the mg with `is_group=0` on first sight — the adapter hasn't told us
+  // yet whether it's actually a group. Fall back to the InboundEvent's
+  // `threadId`: a non-null threadId implies a threaded platform (Slack
+  // channel thread, Discord thread), which we treat as a group.
+  const isGroup = event.threadId !== null;
+  const engageMode: MessagingGroupAgent['engage_mode'] = isGroup ? 'mention-sticky' : 'pattern';
+  const engagePattern = isGroup ? null : '.';
+
+  const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  createMessagingGroupAgent({
+    id: mgaId,
+    messaging_group_id: messagingGroupId,
+    agent_group_id: agentGroupId,
+    engage_mode: engageMode,
+    engage_pattern: engagePattern,
+    sender_scope: 'known',
+    ignored_message_policy: 'accumulate',
+    session_mode: 'shared',
+    priority: 0,
+    created_at: new Date().toISOString(),
+  });
+  log.info('Channel wiring created', {
+    messagingGroupId,
+    agentGroupId,
+    mgaId,
+    engageMode,
+    approverId: approverUserId,
+  });
+
+  // Auto-admit the triggering sender. Without this, the replay below
+  // would bounce through sender-approval (sender_scope='known' +
+  // sender-is-not-a-member). Owners/admins are implicit members per
+  // isMember(), so this is a no-op INSERT OR IGNORE for them.
+  const senderUserId = extractAndUpsertUser(event);
+  if (senderUserId) {
+    addMember({
+      user_id: senderUserId,
+      agent_group_id: agentGroupId,
+      added_by: approverUserId,
+      added_at: new Date().toISOString(),
+    });
+  }
+
+  try {
+    await routeInbound(event);
+  } catch (err) {
+    log.error('Failed to replay message after channel wiring', { messagingGroupId, err });
+  }
+}
+
+/**
+ * Send a plain-text DM to the owner confirming an auto-wired channel.
+ * Used by the sole-owner shortcut so the wiring isn't fully invisible —
+ * if it happened on a server the owner didn't intend, they see it
+ * immediately and can react.
+ */
+async function sendAutoWireConfirmation(
+  ownerUserId: string,
+  channelMg: MessagingGroup,
+  agent: AgentGroup,
+): Promise<void> {
+  const ownerDm = await ensureUserDm(ownerUserId);
+  if (!ownerDm) {
+    log.warn('Auto-wire confirmation skipped — no DM channel for owner', { ownerUserId });
+    return;
+  }
+  const adapter = getDeliveryAdapter();
+  if (!adapter) {
+    log.warn('Auto-wire confirmation skipped — no delivery adapter', { ownerUserId });
+    return;
+  }
+  const channelLabel = channelMg.name || channelMg.platform_id;
+  const text = `Auto-wired ${channelLabel} to ${agent.name} (sole-owner shortcut).`;
+  try {
+    await adapter.deliver(
+      ownerDm.channel_type,
+      ownerDm.platform_id,
+      null,
+      'chat-sdk',
+      JSON.stringify({ text }),
+    );
+  } catch (err) {
+    log.error('Auto-wire confirmation delivery failed', { ownerUserId, err });
+  }
+}
+
 setChannelRequestGate(async (mg, event) => {
+  // Sole-owner shortcut: skip the approval card when the sender is the
+  // sole owner AND there's exactly one agent group to wire to. The choice
+  // of target is unambiguous and the approver is the same person who'd
+  // receive the card — the click adds friction without protection.
+  //
+  // Falls back to the approval flow the moment a co-owner is added or a
+  // second agent group exists. The co-owner gate is intentional: new
+  // owners get full visibility into what gets wired even though their
+  // single click would have approved it anyway.
+  const senderUserId = extractAndUpsertUser(event);
+  if (senderUserId && isOwner(senderUserId)) {
+    const owners = getOwners();
+    const agentGroups = getAllAgentGroups();
+    if (owners.length === 1 && agentGroups.length === 1) {
+      const target = agentGroups[0];
+      log.info('Channel auto-wired — sole-owner shortcut', {
+        messagingGroupId: mg.id,
+        agentGroupId: target.id,
+        owner: senderUserId,
+      });
+      await applyChannelWiring(mg.id, target.id, event, senderUserId);
+      await sendAutoWireConfirmation(senderUserId, mg, target);
+      return;
+    }
+  }
   await requestChannelApproval({ messagingGroupId: mg.id, event });
 });
 
@@ -327,66 +461,16 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     return true;
   }
 
-  // Decide engage_mode from the original event. DMs (`isMention=true` &
-  // not in a group) get `pattern='.'` (always respond). Group mentions
-  // get `mention-sticky` (respond now + follow the thread).
-  //
-  // We can't read `mg.is_group` reliably here because we only auto-create
-  // the mg with `is_group=0` on first sight — the adapter hasn't told us
-  // yet whether it's actually a group. Fall back to the InboundEvent's
-  // `threadId`: a non-null threadId implies a threaded platform (Slack
-  // channel thread, Discord thread), which we treat as a group.
-  const isGroup = event.threadId !== null;
-  const engageMode: MessagingGroupAgent['engage_mode'] = isGroup ? 'mention-sticky' : 'pattern';
-  const engagePattern = isGroup ? null : '.';
-
-  const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  createMessagingGroupAgent({
-    id: mgaId,
-    messaging_group_id: row.messaging_group_id,
-    agent_group_id: row.agent_group_id,
-    engage_mode: engageMode,
-    engage_pattern: engagePattern,
-    sender_scope: 'known',
-    ignored_message_policy: 'accumulate',
-    session_mode: 'shared',
-    priority: 0,
-    created_at: new Date().toISOString(),
-  });
-  log.info('Channel registration approved — wiring created', {
+  // Clear the pending row BEFORE wiring + replay so the gate check on
+  // the replayed event sees a wired channel (agentCount > 0) and takes
+  // the fan-out path instead of re-escalating.
+  deletePendingChannelApproval(row.messaging_group_id);
+  log.info('Channel registration approved', {
     messagingGroupId: row.messaging_group_id,
     agentGroupId: row.agent_group_id,
-    mgaId,
-    engageMode,
     approverId,
   });
-
-  // Auto-admit the triggering sender. Without this, the replay below
-  // would bounce through sender-approval (sender_scope='known' +
-  // sender-is-not-a-member).
-  const senderUserId = extractAndUpsertUser(event);
-  if (senderUserId) {
-    addMember({
-      user_id: senderUserId,
-      agent_group_id: row.agent_group_id,
-      added_by: approverId,
-      added_at: new Date().toISOString(),
-    });
-  }
-
-  // Clear the pending row BEFORE replay so the gate check on the second
-  // attempt sees a wired channel (agentCount > 0) and takes the fan-out
-  // path normally.
-  deletePendingChannelApproval(row.messaging_group_id);
-
-  try {
-    await routeInbound(event);
-  } catch (err) {
-    log.error('Failed to replay message after channel approval', {
-      messagingGroupId: row.messaging_group_id,
-      err,
-    });
-  }
+  await applyChannelWiring(row.messaging_group_id, row.agent_group_id, event, approverId);
   return true;
 }
 
