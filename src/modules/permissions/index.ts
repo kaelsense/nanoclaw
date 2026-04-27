@@ -15,9 +15,13 @@
  * Without this module: sender resolution is a no-op (userId=null); the
  * access gate is not registered and core defaults to allow-all.
  */
-import { getAllAgentGroups } from '../../db/agent-groups.js';
+import { getAgentGroup } from '../../db/agent-groups.js';
 import { recordDroppedMessage } from '../../db/dropped-messages.js';
-import { createMessagingGroupAgent, setMessagingGroupDeniedAt } from '../../db/messaging-groups.js';
+import {
+  createMessagingGroupAgent,
+  getAgentGroupsWiredToChannelType,
+  setMessagingGroupDeniedAt,
+} from '../../db/messaging-groups.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import {
   routeInbound,
@@ -365,28 +369,36 @@ async function sendAutoWireConfirmation(
 
 setChannelRequestGate(async (mg, event) => {
   // Sole-owner shortcut: skip the approval card when the sender is the
-  // sole owner AND there's exactly one agent group to wire to. The choice
-  // of target is unambiguous and the approver is the same person who'd
-  // receive the card — the click adds friction without protection.
+  // sole owner AND exactly one agent group is already wired to this
+  // channel_type. The target is unambiguous and the approver is the same
+  // person who'd receive the card — the click adds friction without
+  // protection.
   //
-  // Falls back to the approval flow the moment a co-owner is added or a
-  // second agent group exists. The co-owner gate is intentional: new
-  // owners get full visibility into what gets wired even though their
-  // single click would have approved it anyway.
+  // Scope is per-channel_type, not global: a CLI-only `Terminal Agent`
+  // doesn't block the shortcut for a new Discord channel. First-ever
+  // channel of a channel_type (count=0) falls back to the approval flow
+  // so the owner explicitly picks which agent to wire.
+  //
+  // Co-owner gate is intentional: new owners get full visibility into
+  // what gets wired even though their single click would have approved
+  // it anyway.
   const senderUserId = extractAndUpsertUser(event);
   if (senderUserId && isOwner(senderUserId)) {
     const owners = getOwners();
-    const agentGroups = getAllAgentGroups();
-    if (owners.length === 1 && agentGroups.length === 1) {
-      const target = agentGroups[0];
-      log.info('Channel auto-wired — sole-owner shortcut', {
-        messagingGroupId: mg.id,
-        agentGroupId: target.id,
-        owner: senderUserId,
-      });
-      await applyChannelWiring(mg.id, target.id, event, senderUserId);
-      await sendAutoWireConfirmation(senderUserId, mg, target);
-      return;
+    const wiredAgentIds = getAgentGroupsWiredToChannelType(event.channelType);
+    if (owners.length === 1 && wiredAgentIds.length === 1) {
+      const target = getAgentGroup(wiredAgentIds[0]);
+      if (target) {
+        log.info('Channel auto-wired — sole-owner shortcut', {
+          messagingGroupId: mg.id,
+          agentGroupId: target.id,
+          channelType: event.channelType,
+          owner: senderUserId,
+        });
+        await applyChannelWiring(mg.id, target.id, event, senderUserId);
+        await sendAutoWireConfirmation(senderUserId, mg, target);
+        return;
+      }
     }
   }
   await requestChannelApproval({ messagingGroupId: mg.id, event });

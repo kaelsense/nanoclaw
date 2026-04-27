@@ -373,7 +373,34 @@ describe('sole-owner shortcut', () => {
     };
   }
 
-  it('auto-wires (no card) when sole owner mentions the bot in a new channel with single agent group', async () => {
+  // Pre-wire ag-1 to an existing telegram channel so the shortcut's
+  // "exactly one agent on this channel_type" precondition is satisfied.
+  // Mirrors a real install where the owner's DM is already wired before
+  // a new group channel is mentioned.
+  async function preWireAg1ToTelegram() {
+    createMessagingGroup({
+      id: 'mg-existing-tg',
+      channel_type: 'telegram',
+      platform_id: 'tg-existing',
+      name: 'Existing TG',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    const { getDb } = await import('../../db/connection.js');
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_group_agents
+           (id, messaging_group_id, agent_group_id, engage_mode, engage_pattern,
+            sender_scope, ignored_message_policy, session_mode, priority, created_at)
+         VALUES (?, ?, ?, 'pattern', '.', 'all', 'accumulate', 'shared', 0, ?)`,
+      )
+      .run('mga-existing', 'mg-existing-tg', 'ag-1', now());
+  }
+
+  it('auto-wires (no card) when sole owner mentions the bot in a new channel and the channel_type already has exactly one wired agent', async () => {
+    await preWireAg1ToTelegram();
+
     const { routeInbound } = await import('../../router.js');
     const { wakeContainer } = await import('../../container-runner.js');
     (wakeContainer as unknown as ReturnType<typeof vi.fn>).mockClear();
@@ -383,12 +410,10 @@ describe('sole-owner shortcut', () => {
 
     const { getDb } = await import('../../db/connection.js');
 
-    // No approval card path was taken: no pending row.
     const pendingCount = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number })
       .c;
     expect(pendingCount).toBe(0);
 
-    // Wiring was created directly.
     const mg = getMessagingGroupByPlatform('telegram', 'chat-owner-shortcut');
     expect(mg).toBeDefined();
     const mga = getDb()
@@ -400,10 +425,8 @@ describe('sole-owner shortcut', () => {
     expect(mga.agent_group_id).toBe('ag-1');
     expect(mga.engage_mode).toBe('mention-sticky');
 
-    // Container woken via replay.
     expect(wakeContainer).toHaveBeenCalled();
 
-    // Owner received a confirmation DM (plain text, not an ask_question card).
     expect(deliverMock).toHaveBeenCalledTimes(1);
     const [channel, platformId, , , content] = deliverMock.mock.calls[0];
     expect(channel).toBe('telegram');
@@ -414,7 +437,8 @@ describe('sole-owner shortcut', () => {
     expect(payload.text).toContain('Andy');
   });
 
-  it('falls back to approval flow when a co-owner exists, even with a single agent group', async () => {
+  it('falls back to approval flow when a co-owner exists, even with a single wired agent', async () => {
+    await preWireAg1ToTelegram();
     upsertUser({ id: 'telegram:co-owner', kind: 'telegram', display_name: 'Co', created_at: now() });
     grantRole({
       user_id: 'telegram:co-owner',
@@ -429,8 +453,6 @@ describe('sole-owner shortcut', () => {
     await new Promise((r) => setTimeout(r, 10));
 
     const { getDb } = await import('../../db/connection.js');
-
-    // Approval card was delivered; no wiring yet.
     const pendingCount = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number })
       .c;
     expect(pendingCount).toBe(1);
@@ -444,17 +466,78 @@ describe('sole-owner shortcut', () => {
     expect(mgaCount).toBe(0);
   });
 
-  it('falls back to approval flow when a second agent group exists, even with a sole owner', async () => {
+  it('falls back to approval flow when two agents are both wired to this channel_type (ambiguous target)', async () => {
+    await preWireAg1ToTelegram();
     createAgentGroup({ id: 'ag-2', name: 'Beta', folder: 'beta', agent_provider: null, created_at: now() });
+    const { getDb } = await import('../../db/connection.js');
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_group_agents
+           (id, messaging_group_id, agent_group_id, engage_mode, engage_pattern,
+            sender_scope, ignored_message_policy, session_mode, priority, created_at)
+         VALUES (?, ?, ?, 'pattern', '.', 'all', 'accumulate', 'shared', 0, ?)`,
+      )
+      .run('mga-existing-2', 'mg-existing-tg', 'ag-2', now());
 
     const { routeInbound } = await import('../../router.js');
     await routeInbound(ownerMention('chat-multi-agent'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const pendingCount = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number })
+      .c;
+    expect(pendingCount).toBe(1);
+  });
+
+  it('falls back to approval flow when this channel_type has zero wired agents (first-ever channel of type)', async () => {
+    // No preWireAg1ToTelegram() — agent exists but is not wired to any
+    // telegram channel. Owner explicitly picks the target via approval card.
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(ownerMention('chat-first-of-type'));
     await new Promise((r) => setTimeout(r, 10));
 
     const { getDb } = await import('../../db/connection.js');
     const pendingCount = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number })
       .c;
     expect(pendingCount).toBe(1);
+  });
+
+  it('does not let a CLI-only agent block a telegram shortcut (cross-channel-type isolation)', async () => {
+    // ag-1 wired to telegram (via preWire); ag-cli wired only to CLI.
+    // From a telegram sender's view, telegram has exactly one wired agent
+    // → shortcut should fire and pick ag-1.
+    await preWireAg1ToTelegram();
+    createAgentGroup({ id: 'ag-cli', name: 'CLI Bot', folder: 'cli-bot', agent_provider: null, created_at: now() });
+    createMessagingGroup({
+      id: 'mg-cli',
+      channel_type: 'cli',
+      platform_id: 'local',
+      name: 'CLI',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    const { getDb } = await import('../../db/connection.js');
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_group_agents
+           (id, messaging_group_id, agent_group_id, engage_mode, engage_pattern,
+            sender_scope, ignored_message_policy, session_mode, priority, created_at)
+         VALUES (?, ?, ?, 'pattern', '.', 'all', 'accumulate', 'shared', 0, ?)`,
+      )
+      .run('mga-cli', 'mg-cli', 'ag-cli', now());
+
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(ownerMention('chat-cross-type'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const pendingCount = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number })
+      .c;
+    expect(pendingCount).toBe(0);
+    const mg = getMessagingGroupByPlatform('telegram', 'chat-cross-type');
+    const mga = getDb()
+      .prepare('SELECT agent_group_id FROM messaging_group_agents WHERE messaging_group_id = ?')
+      .get(mg!.id) as { agent_group_id: string };
+    expect(mga.agent_group_id).toBe('ag-1');
   });
 });
 

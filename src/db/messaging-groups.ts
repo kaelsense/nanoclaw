@@ -196,6 +196,25 @@ export function getMessagingGroupAgents(messagingGroupId: string): MessagingGrou
     .all(messagingGroupId) as MessagingGroupAgent[];
 }
 
+/**
+ * Distinct agent_group_ids that have at least one wiring on a
+ * messaging_group of the given channel_type. Used by the sole-owner
+ * shortcut to scope "single agent" to the sender's channel — installs
+ * with a CLI-only agent shouldn't count it against a Discord shortcut.
+ */
+export function getAgentGroupsWiredToChannelType(channelType: string): string[] {
+  return (
+    getDb()
+      .prepare(
+        `SELECT DISTINCT mga.agent_group_id
+         FROM messaging_group_agents mga
+         JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+         WHERE mg.channel_type = ?`,
+      )
+      .all(channelType) as Array<{ agent_group_id: string }>
+  ).map((r) => r.agent_group_id);
+}
+
 export function getMessagingGroupAgentByPair(
   messagingGroupId: string,
   agentGroupId: string,
