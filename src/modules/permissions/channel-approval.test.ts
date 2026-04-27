@@ -384,16 +384,17 @@ describe('sole-owner shortcut', () => {
     const { getDb } = await import('../../db/connection.js');
 
     // No approval card path was taken: no pending row.
-    const pendingCount = (
-      getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }
-    ).c;
+    const pendingCount = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number })
+      .c;
     expect(pendingCount).toBe(0);
 
     // Wiring was created directly.
     const mg = getMessagingGroupByPlatform('telegram', 'chat-owner-shortcut');
     expect(mg).toBeDefined();
     const mga = getDb()
-      .prepare('SELECT agent_group_id, engage_mode, engage_pattern FROM messaging_group_agents WHERE messaging_group_id = ?')
+      .prepare(
+        'SELECT agent_group_id, engage_mode, engage_pattern FROM messaging_group_agents WHERE messaging_group_id = ?',
+      )
       .get(mg!.id) as { agent_group_id: string; engage_mode: string; engage_pattern: string | null };
     expect(mga).toBeDefined();
     expect(mga.agent_group_id).toBe('ag-1');
@@ -430,16 +431,15 @@ describe('sole-owner shortcut', () => {
     const { getDb } = await import('../../db/connection.js');
 
     // Approval card was delivered; no wiring yet.
-    const pendingCount = (
-      getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }
-    ).c;
+    const pendingCount = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number })
+      .c;
     expect(pendingCount).toBe(1);
 
     const mg = getMessagingGroupByPlatform('telegram', 'chat-multi-owner');
     const mgaCount = (
-      getDb()
-        .prepare('SELECT COUNT(*) AS c FROM messaging_group_agents WHERE messaging_group_id = ?')
-        .get(mg!.id) as { c: number }
+      getDb().prepare('SELECT COUNT(*) AS c FROM messaging_group_agents WHERE messaging_group_id = ?').get(mg!.id) as {
+        c: number;
+      }
     ).c;
     expect(mgaCount).toBe(0);
   });
@@ -452,9 +452,8 @@ describe('sole-owner shortcut', () => {
     await new Promise((r) => setTimeout(r, 10));
 
     const { getDb } = await import('../../db/connection.js');
-    const pendingCount = (
-      getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }
-    ).c;
+    const pendingCount = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number })
+      .c;
     expect(pendingCount).toBe(1);
   });
 });

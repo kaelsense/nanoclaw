@@ -357,13 +357,7 @@ async function sendAutoWireConfirmation(
   const channelLabel = channelMg.name || channelMg.platform_id;
   const text = `Auto-wired ${channelLabel} to ${agent.name} (sole-owner shortcut).`;
   try {
-    await adapter.deliver(
-      ownerDm.channel_type,
-      ownerDm.platform_id,
-      null,
-      'chat-sdk',
-      JSON.stringify({ text }),
-    );
+    await adapter.deliver(ownerDm.channel_type, ownerDm.platform_id, null, 'chat-sdk', JSON.stringify({ text }));
   } catch (err) {
     log.error('Auto-wire confirmation delivery failed', { ownerUserId, err });
   }
